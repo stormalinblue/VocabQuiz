@@ -18,60 +18,61 @@ def decay_sum_wp(table, current_time):
 def decay_sum_wd(table, current_time):
     return table.groupby('definition_id').aggregate(lambda x: decay_sum(x, current_time))
 
+def word_weight_table(connection, user_id, timestamp):
+    word_definition_query = '''
+    select
+        wp.id as word_pos_id, 1.0 as correct, 1.0 as incorrect
+        from word_parts_of_speech as wp
+    order by wp.id'''
+    word_weight_table = pd.read_sql(
+        word_definition_query,
+        con=connection,
+        index_col='word_pos_id')
+
+    correct_query = '''
+    select
+        word_pos_id, response_date as weight
+        from word_pos_correctness
+    where
+        user_id = ?
+        and correct'''
+    correct_table = pd.read_sql(
+        correct_query,
+        params=(user_id,),
+        con=connection)
+    correct_sum = decay_sum_wp(correct_table, timestamp)
+
+    incorrect_query = '''
+    select
+        word_pos_id, response_date as weight
+        from word_pos_correctness
+    where
+        user_id = ?
+        and not correct'''
+    incorrect_table = pd.read_sql(
+        incorrect_query,
+        params=(user_id,),
+        con=connection)
+    incorrect_sum = decay_sum_wp(incorrect_table, timestamp)
+
+    word_weight_table['correct'] = word_weight_table['correct'].add(
+        correct_sum['weight'],
+        fill_value=0)
+    word_weight_table['incorrect'] = word_weight_table['incorrect'].add(
+        incorrect_sum['weight'],
+        fill_value=0)
+    return word_weight_table
+
+
 class GameModel(object):
     def __init__(self, connection):
         self.connection = connection
     
     def _get_question_id(self, user, timestamp):
-        word_definition_query = '''
-        select
-            wp.id as word_pos_id, 1.0 as correct, 1.0 as incorrect
-            from word_parts_of_speech as wp
-        order by wp.id'''
-        word_weight_table = pd.read_sql(
-            word_definition_query,
-            con=self.connection,
-            index_col='word_pos_id')
-
-        correct_query = '''
-        select
-            word_pos_id, response_date as weight
-            from word_pos_correctness
-        where
-            user_id = ?
-            and correct'''
-        correct_table = pd.read_sql(
-            correct_query,
-            params=(user.user_id,),
-            con=self.connection)
-        correct_sum = decay_sum_wp(correct_table, timestamp)
-
-        incorrect_query = '''
-        select
-            word_pos_id, response_date as weight
-            from word_pos_correctness
-        where
-            user_id = ?
-            and not correct'''
-        incorrect_table = pd.read_sql(
-            incorrect_query,
-            params=(user.user_id,),
-            con=self.connection)
-        incorrect_sum = decay_sum_wp(incorrect_table, timestamp)
-
-        word_weight_table['correct'] = word_weight_table['correct'].add(
-            correct_sum['weight'],
-            fill_value=0)
-        word_weight_table['incorrect'] = word_weight_table['incorrect'].add(
-            incorrect_sum['weight'],
-            fill_value=0)
-
-        return int(word_weight_table.apply(
+        return int(word_weight_table(self.connection, user.user_id, timestamp).apply(
             lambda x: random.betavariate(x[0], x[1]),
             raw=True,
             axis=1).idxmin())
-
-    
 
     def _get_choices(self, user, word_pos_id, timestamp, num_options=4):
         src_defn_query = '''
@@ -133,8 +134,7 @@ class GameModel(object):
             fill_value=0)
         
         src_defn_id = int(src_defn_weight_table.apply(
-            lambda x: random.betavariate(x[0], x[1]),
-            raw=True,
+            lambda x: random.betavariate(x['selected'], x['not_selected']),
             axis=1).idxmin())
 
         alt_defn_id_query = '''
@@ -198,8 +198,7 @@ class GameModel(object):
         
         # TODO: Sample and choose min
         rewards = alt_defn_weight_table.apply(
-            lambda x: random.betavariate(x[0], x[1]),
-            raw=True,
+            lambda x: random.betavariate(x['selected'], x['not_selected']),
             axis=1)
         best_alternates = rewards.sort_values(ascending=True).index.get_level_values('definition_id')[:num_options - 1]
 
