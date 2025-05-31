@@ -1,36 +1,44 @@
-import random
+from typing import Dict, cast, Any
+
 import string
 
+import pandas as pd
+
 from ..common import exceptions
+from ..common.util import utc_now_sec_timestamp
+
+from ..user.model import UserModel
+from ..game.model import GameModel
 
 class GameCLIView(object):
-    def __init__(self, game_model, user_model):
+    def __init__(self, game_model: GameModel, user_model: UserModel):
         self.game_model = game_model
         self.user_model = user_model
     
-    def play_game(self, args):
-        user_name = args.username
-
+    def play_game(self, args) -> None:
+        username: str = cast(str, args.username)
 
         try:
-            user = self.user_model.create_session(user_name)
+            user = self.user_model.create_session(username)
         except exceptions.NotFound:
             print('User not found')
             exit(1)
 
-        print('Playing as', user_name)
+        print('Playing as', user.username)
         print()
 
         try:
             while True:
-                presentation_id = self.game_model.create_question(user)
+                print('getting new question')
+                presentation_id = self.game_model.create_question(user, utc_now_sec_timestamp())
+                print('got question')
 
                 presentation = self.game_model.get_presentation_info(user, presentation_id)
                 question = presentation['question']
-                word = question['word']
-                part_of_speech = question['part_of_speech']
-                options = presentation['options']
-                letter_index = dict(zip(string.ascii_uppercase, options.index))
+                word: str = question['word']
+                part_of_speech: str = question['part_of_speech']
+                options: pd.DataFrame = presentation['options']
+                letter_index: Dict[str, int] = dict(zip(string.ascii_uppercase, options.index))
 
                 print(f'{word} ({part_of_speech})')
 
@@ -40,12 +48,13 @@ class GameCLIView(object):
                     print(f'{letter}) {option.text}')
 
                 while True:
+                    print('waiting for answer')
                     user_input = input().strip().upper()
                     if user_input not in letter_index:
                         print('Incorrect. Try again.')
                     else:
                         input_index = letter_index[user_input]
-                        is_correct = self.game_model.is_correct_answer(user, presentation_id, input_index)
+                        is_correct: bool = self.game_model.is_correct_answer(user, presentation_id, input_index)
                         if not is_correct:
                             print('Incorrect. That is the definition of', options.loc[letter_index[user_input]].word)
                         else:
@@ -61,13 +70,14 @@ class GameCLIView(object):
                         if is_correct:
                             break
                         else:
-                            presentation_id = self.game_model.re_presentation(user, presentation_id)
+                            presentation_id = self.game_model.re_presentation(user, presentation_id, utc_now_sec_timestamp())
                 print()
-        except KeyboardInterrupt:
+        except KeyboardInterrupt as e:
             print('Goodbye!')
+            raise e
 
 
-    def add_subparsers(self, parent_subparsers):
+    def add_subparsers(self, parent_subparsers: Any) -> None:
         game_parser = parent_subparsers.add_parser(
             'game', help='Play the game')
         game_subparsers = game_parser.add_subparsers()

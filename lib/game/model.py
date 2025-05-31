@@ -1,24 +1,28 @@
 import math
 import random
+import sqlite3
+from typing import Iterable
 
 import pandas as pd
 import numpy as np
 
-from ..common.util import utc_now_sec_timestamp
+
 from ..common import exceptions
+from ..user.model import User
 
-LAMBDA = math.log(1 - 0.02)
+LAMBDA: float = math.log(1 - 0.02)
+SECONDS_IN_DAY = 86400
 
-def decay_sum(table, current_time):
-    return np.sum(np.exp(LAMBDA * (current_time - table) / 86400))
+def decay_sum(table: pd.DataFrame, current_time: float) -> float:
+    return np.sum(np.exp(LAMBDA * (current_time - table) / SECONDS_IN_DAY))
 
-def decay_sum_wp(table, current_time):
+def decay_sum_wp(table: pd.DataFrame, current_time: float) -> pd.DataFrame:
     return table.groupby('word_pos_id').aggregate(lambda x: decay_sum(x, current_time))
 
-def decay_sum_wd(table, current_time):
+def decay_sum_wd(table: pd.DataFrame, current_time: float):
     return table.groupby('definition_id').aggregate(lambda x: decay_sum(x, current_time))
 
-def word_weight_table(connection, user_id, timestamp):
+def word_weight_table(connection: sqlite3.Connection, user_id: int, timestamp: int):
     word_definition_query = '''
     select
         wp.id as word_pos_id, 1.0 as correct, 1.0 as incorrect
@@ -65,16 +69,16 @@ def word_weight_table(connection, user_id, timestamp):
 
 
 class GameModel(object):
-    def __init__(self, connection):
+    def __init__(self, connection: sqlite3.Connection):
         self.connection = connection
     
-    def _get_question_id(self, user, timestamp):
+    def _get_question_id(self, user: User, timestamp: int):
         return int(word_weight_table(self.connection, user.user_id, timestamp).apply(
             lambda x: random.betavariate(x[0], x[1]),
             raw=True,
             axis=1).idxmin())
 
-    def _get_choices(self, user, word_pos_id, timestamp, num_options=4):
+    def _get_choices(self, user: User, word_pos_id: int, timestamp: int, num_options: int=4):
         src_defn_query = '''
         select
             wd.id as definition_id, 1.0 as selected, 1.0 as not_selected
@@ -206,10 +210,10 @@ class GameModel(object):
         random.shuffle(all_options)
         return all_options
 
-    def create_question(self, user):
+    def create_question(self, user: User, now_timestamp: int):
         cur = self.connection.cursor()
 
-        timestamp = utc_now_sec_timestamp()
+        timestamp = now_timestamp
         word_pos_id = self._get_question_id(user, timestamp)
         presented_options = self._get_choices(user, word_pos_id, timestamp)
 
@@ -224,7 +228,7 @@ class GameModel(object):
 
         return presentation_id
 
-    def _register_question(self, cur, question, timestamp):
+    def _register_question(self, cur: sqlite3.Cursor, question, timestamp: int) -> int:
         cur = self.connection.cursor()
         question_id = cur.execute('''
             insert into mcq_questions
@@ -242,13 +246,13 @@ class GameModel(object):
         
         return question_id
     
-    def _create_presentation(self, cur, user, question_id, timestamp):
+    def _create_presentation(self, cur: sqlite3.Cursor, user: User, question_id: int, timestamp: int) -> int:
         return cur.execute('''
             insert into mcq_log
                 (user_id, question_id, presentation_date)
                 values (?, ?, ?) returning id''', (user.user_id, question_id, timestamp)).fetchone()[0]
 
-    def get_presentation_info(self, user, presentation_id):
+    def get_presentation_info(self, user: User, presentation_id: int):
         cur = self.connection.cursor()
         word, part_of_speech = cur.execute(
         '''
@@ -271,7 +275,7 @@ class GameModel(object):
             pos.name as part_of_speech
         from mcq_log
             join mcq_responses on mcq_responses.question_id = mcq_log.question_id
-            join latest_definitions as ld on ld.id = mcq_responses.response_id
+            join latest_definitions as ld on ld.definition_id = mcq_responses.response_id
             join word_parts_of_speech as word_pos on word_pos.id = ld.word_pos_id
             join words on words.id = word_pos.word_id
             join parts_of_speech as pos on pos.id = word_pos.part_of_speech_id
@@ -294,29 +298,28 @@ class GameModel(object):
     
  
 
-    def re_presentation(self, user, presentation_id):
-        cur = self.connection.cursor()
-        results = cur.execute('''
-            select question_id from mcq_log where
-                mcq_log.id = ? and mcq_log.user_id = ?''', (presentation_id, user.user_id)).fetchall()
-        
-        if not results:
-            return exceptions.NotFound
+    def re_presentation(self, user: User, presentation_id: int, now_timestamp: int):
+        with self.connection:
+            cur = self.connection.cursor()
+            results = cur.execute('''
+                select question_id from mcq_log where
+                    mcq_log.id = ? and mcq_log.user_id = ?''', (presentation_id, user.user_id)).fetchall()
+            
+            if not results:
+                raise exceptions.NotFound
 
-        question_id = results[0][0]
+            question_id = results[0][0]
 
-        new_presentation_id = cur.execute('''
-            insert into mcq_log
-                (user_id, question_id, presentation_date)
-                values (?, ?, ?)
-                returning id''',
-                (user.user_id, question_id, utc_now_sec_timestamp())).fetchone()[0]
-        
-        self.connection.commit()
+            new_presentation_id: int = cur.execute('''
+                insert into mcq_log
+                    (user_id, question_id, presentation_date)
+                    values (?, ?, ?)
+                    returning id''',
+                    (user.user_id, question_id, now_timestamp)).fetchone()[0]
 
-        return new_presentation_id
+            return new_presentation_id
 
-    def _is_authorized_for_presentation(self, cur, user, presentation_id):
+    def _is_authorized_for_presentation(self, cur: sqlite3.Cursor, user: User, presentation_id: int):
         authorized = cur.execute(
             '''
             select count(*) from mcq_log where id = ? and user_id = ?''',
@@ -324,7 +327,7 @@ class GameModel(object):
         ).fetchone()[0] == 1
         return authorized
 
-    def is_correct_answer(self, user, presentation_id, response_index):
+    def is_correct_answer(self, user: User, presentation_id: int, response_index: int) -> bool:
         cur = self.connection.cursor()
         if not self._is_authorized_for_presentation(cur, user, presentation_id):
             raise exceptions.NotAuthorized
@@ -354,12 +357,12 @@ class GameModel(object):
         ).fetchone()[0]
         return result
 
-    def create_user_response(self, user, presentation_id, responses):
+    def create_user_response(self, user: User, presentation_id: int, responses: Iterable[int]):
         cur = self.connection.cursor()
         if not self._is_authorized_for_presentation(cur, user, presentation_id):
             raise exceptions.NotAuthorized
         
-        question_id = cur.execute(
+        question_id: int = cur.execute(
             '''select question_id from mcq_log where mcq_log.id = ?''', (presentation_id,)).fetchone()[0]
 
         for response_index in responses:
