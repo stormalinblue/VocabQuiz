@@ -18,6 +18,9 @@ class GameCLIView(object):
     def play_game(self, args) -> None:
         username: str = cast(str, args.username)
 
+        question_number: int = 1
+        streak: int = 0
+
         try:
             user = self.user_model.create_session(username)
         except exceptions.NotFound:
@@ -29,9 +32,9 @@ class GameCLIView(object):
 
         try:
             while True:
-                print('getting new question')
+                # print('getting new question')
                 presentation_id = self.game_model.create_question(user, utc_now_sec_timestamp())
-                print('got question')
+                # print('got question')
 
                 presentation = self.game_model.get_presentation_info(user, presentation_id)
                 question = presentation['question']
@@ -40,7 +43,9 @@ class GameCLIView(object):
                 options: pd.DataFrame = presentation['options']
                 letter_index: Dict[str, int] = dict(zip(string.ascii_uppercase, options.index))
 
-                print(f'{word} ({part_of_speech})')
+                if streak > 0:
+                    print(f'Streak: {streak}')
+                print(f'{question_number}) {word} ({part_of_speech})')
 
                 letters = list(sorted(letter_index.keys()))
                 for letter in letters:
@@ -48,7 +53,7 @@ class GameCLIView(object):
                     print(f'{letter}) {option.text}')
 
                 while True:
-                    print('waiting for answer')
+                    # print('waiting for answer')
                     user_input = input().strip().upper()
                     if user_input not in letter_index:
                         print('Incorrect. Try again.')
@@ -57,8 +62,11 @@ class GameCLIView(object):
                         is_correct: bool = self.game_model.is_correct_answer(user, presentation_id, input_index)
                         if not is_correct:
                             print('Incorrect. That is the definition of', options.loc[letter_index[user_input]].word)
+                            streak = 0
                         else:
                             print('Correct!')
+                            question_number += 1
+                            streak += 1
                             for letter, index in sorted(letter_index.items()):
                                 print(f'{letter} -> {options.loc[index].word}')
 
