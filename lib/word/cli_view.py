@@ -16,6 +16,7 @@ class WordCLIView(object):
         try:
             word: str = cast(str, args.new_word)
             self.model.add_word(word, now)
+            self._print_word_details(word)
         except exceptions.NotModified:
             print('We already have this word.')
     
