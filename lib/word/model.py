@@ -52,6 +52,7 @@ class WordModel(object):
             join parts_of_speech as pos
                 on word_pos.part_of_speech_id = pos.id
                 where word_pos.word_id = ?
+            order by ld.definition_id
             ''', (word_id,)).fetchall()
 
         return {
