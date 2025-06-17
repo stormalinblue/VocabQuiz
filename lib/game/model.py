@@ -1,35 +1,43 @@
 import math
 import random
 import sqlite3
-from typing import Iterable
+from typing import Callable, Iterable, Any
 
 import pandas as pd
 import numpy as np
-
 
 from ..common import exceptions
 from ..user.model import User
 
 LAMBDA: float = math.log(1 - 0.02)
+PRIOR_CORRECT: float = 0.25
+PRIOR_INCORRECT: float = 0.75
 SECONDS_IN_DAY = 86400
 
-def decay_sum(table: pd.DataFrame, current_time: float) -> float:
-    return np.sum(np.exp(LAMBDA * (current_time - table) / SECONDS_IN_DAY))
+def decay_sum(table: pd.DataFrame, current_time: float, decay_factor: float) -> float:
+    return np.sum(np.exp(decay_factor * (current_time - table) / SECONDS_IN_DAY))
 
-def decay_sum_wp(table: pd.DataFrame, current_time: float) -> pd.DataFrame:
-    return table.groupby('word_pos_id').aggregate(lambda x: decay_sum(x, current_time))
+def decay_sum_wp(table: pd.DataFrame, current_time: float, decay_factor: float) -> pd.DataFrame:
+    return table.groupby('word_pos_id').aggregate(lambda x: decay_sum(x, current_time, decay_factor))
 
-def decay_sum_wd(table: pd.DataFrame, current_time: float):
-    return table.groupby('definition_id').aggregate(lambda x: decay_sum(x, current_time))
+def decay_sum_wd(table: pd.DataFrame, current_time: float, decay_factor: float):
+    return table.groupby('definition_id').aggregate(lambda x: decay_sum(x, current_time, decay_factor))
 
-def word_weight_table(connection: sqlite3.Connection, user_id: int, timestamp: int):
+def word_weight_table(
+        connection: sqlite3.Connection,
+        user_id: int,
+        timestamp: int,
+        decay_factor: float = LAMBDA,
+        prior_correct: float = PRIOR_CORRECT,
+        prior_incorrect: float = PRIOR_INCORRECT):
     word_definition_query = '''
     select
-        wp.id as word_pos_id, 1.0 as correct, 1.0 as incorrect
+        wp.id as word_pos_id, ? as correct, ? as incorrect
         from word_parts_of_speech as wp
     order by wp.id'''
     word_weight_table = pd.read_sql(
         word_definition_query,
+        params=(0.0, 0.0),
         con=connection,
         index_col='word_pos_id')
 
@@ -44,7 +52,7 @@ def word_weight_table(connection: sqlite3.Connection, user_id: int, timestamp: i
         correct_query,
         params=(user_id,),
         con=connection)
-    correct_sum = decay_sum_wp(correct_table, timestamp)
+    correct_sum = decay_sum_wp(correct_table, timestamp, decay_factor)
 
     incorrect_query = '''
     select
@@ -57,14 +65,19 @@ def word_weight_table(connection: sqlite3.Connection, user_id: int, timestamp: i
         incorrect_query,
         params=(user_id,),
         con=connection)
-    incorrect_sum = decay_sum_wp(incorrect_table, timestamp)
+    incorrect_sum = decay_sum_wp(incorrect_table, timestamp, decay_factor)
 
-    word_weight_table['correct'] = word_weight_table['correct'].add(
-        correct_sum['weight'],
-        fill_value=0)
-    word_weight_table['incorrect'] = word_weight_table['incorrect'].add(
+    word_weight_table['correct'] = np.maximum(
+        word_weight_table['correct'].add(
+            correct_sum['weight'],
+            fill_value=0
+        ).subtract(
+            incorrect_sum['weight'],
+            fill_value=0
+        ), prior_correct)
+    word_weight_table['incorrect'] = np.maximum(word_weight_table['incorrect'].add(
         incorrect_sum['weight'],
-        fill_value=0)
+        fill_value=0), prior_incorrect)
     return word_weight_table
 
 
@@ -73,22 +86,36 @@ class GameModel(object):
         self.connection = connection
     
     def _get_question_id(self, user: User, timestamp: int):
-        return int(word_weight_table(self.connection, user.user_id, timestamp).apply(
+        word_table = word_weight_table(self.connection, user.user_id, timestamp)
+        word_weights = word_table.apply(
             lambda x: random.betavariate(x[0], x[1]),
             raw=True,
-            axis=1).idxmin())
+            axis=1)
+        word_id = word_weights.idxmin()
+        print('word weight table')
+        print(word_table.loc[word_id])
+        print('word weight', word_weights.loc[word_id])
+        return int(word_id)
 
-    def _get_choices(self, user: User, word_pos_id: int, timestamp: int, num_options: int=4):
+    def _get_choices(
+            self,
+            user: User,
+            word_pos_id: int,
+            timestamp: int,
+            decay_factor: float = LAMBDA,
+            prior_correct: float = PRIOR_CORRECT,
+            prior_incorrect: float = PRIOR_INCORRECT,
+            num_options: int=4):
         src_defn_query = '''
         select
-            wd.id as definition_id, 1.0 as selected, 1.0 as not_selected
+            wd.id as definition_id, ? as selected, ? as not_selected
         from word_definitions as wd
         where wd.word_pos_id = (?)
         order by definition_id
         '''
         src_defn_weight_table = pd.read_sql_query(
             src_defn_query,
-            params=(word_pos_id,),
+            params=(prior_correct, prior_incorrect, word_pos_id,),
             con=self.connection,
             index_col='definition_id')
         
@@ -109,7 +136,7 @@ class GameModel(object):
             src_selected_query,
             params=(user.user_id, word_pos_id),
             con=self.connection)
-        src_selected_sum = decay_sum_wd(src_selected_weight_table, timestamp)
+        src_selected_sum = decay_sum_wd(src_selected_weight_table, timestamp, decay_factor)
 
         src_not_selected_query = '''
         select
@@ -128,7 +155,7 @@ class GameModel(object):
             src_not_selected_query,
             params=(user.user_id, word_pos_id),
             con=self.connection)
-        src_not_selected_sum = decay_sum_wd(src_not_selected_weight_table, timestamp)
+        src_not_selected_sum = decay_sum_wd(src_not_selected_weight_table, timestamp, decay_factor)
 
         src_defn_weight_table['selected'] = src_defn_weight_table['selected'].add(
             src_selected_sum['weight'],
@@ -142,71 +169,79 @@ class GameModel(object):
             axis=1).idxmin())
 
         alt_defn_id_query = '''
-        select alt_defn_id as definition_id, 1.0 as selected, 1.0 as not_selected
+        select alt_defn_id as definition_id, ? as selected, ? as not_selected
         from definition_alternatives
         where source_defn_id = ?
         order by definition_id
         '''
         alt_defn_weight_table = pd.read_sql(
             alt_defn_id_query,
-            params=(src_defn_id,),
+            params=(prior_correct, prior_incorrect, src_defn_id,),
             con=self.connection,
             index_col='definition_id')
-        
-        alt_selected_query = '''
-        select
-            alt_defn_id as definition_id, response_date as weight
-        from
-            definition_alternatives as alt
-            inner join word_pos_word_defn_selectedness as selectedness
-                on selectedness.wd_id = alt.alt_defn_id
-        where selectedness.selected
-            and selectedness.user_id = ?
-            and selectedness.word_pos_id = ?
-            and alt.source_defn_id = ?
-        order by definition_id
-        '''
-        alt_selected_weight_table = pd.read_sql(
-            alt_selected_query,
-            params=(user.user_id, word_pos_id, src_defn_id),
-            con=self.connection,
-            index_col='definition_id')
-        alt_selected_sum = decay_sum_wd(alt_selected_weight_table, timestamp)
-        
-        alt_not_selected_query = '''
-        select
-            alt_defn_id as definition_id, response_date as weight
-        from
-            definition_alternatives as alt
-            inner join word_pos_word_defn_selectedness as selectedness
-                on selectedness.wd_id = alt.alt_defn_id
-        where not selectedness.selected
-            and selectedness.user_id = ?
-            and selectedness.word_pos_id = ?
-            and alt.source_defn_id = ?
-        order by definition_id
-        '''
-        alt_not_selected_weight_table = pd.read_sql(
-            alt_not_selected_query,
-            params=(user.user_id, word_pos_id, src_defn_id),
-            con=self.connection,
-            index_col='definition_id')
-        alt_not_selected_sum = decay_sum_wd(alt_not_selected_weight_table, timestamp)
+        if alt_defn_weight_table.shape[0] != 0:
+            alt_selected_query = '''
+            select
+                alt_defn_id as definition_id, response_date as weight
+            from
+                definition_alternatives as alt
+                inner join word_pos_word_defn_selectedness as selectedness
+                    on selectedness.wd_id = alt.alt_defn_id
+            where selectedness.selected
+                and selectedness.user_id = ?
+                and selectedness.word_pos_id = ?
+                and alt.source_defn_id = ?
+            order by definition_id
+            '''
+            alt_selected_weight_table = pd.read_sql(
+                alt_selected_query,
+                params=(user.user_id, word_pos_id, src_defn_id),
+                con=self.connection,
+                index_col='definition_id')
+            alt_selected_sum = decay_sum_wd(alt_selected_weight_table, timestamp, decay_factor)
+            
+            alt_not_selected_query = '''
+            select
+                alt_defn_id as definition_id, response_date as weight
+            from
+                definition_alternatives as alt
+                inner join word_pos_word_defn_selectedness as selectedness
+                    on selectedness.wd_id = alt.alt_defn_id
+            where not selectedness.selected
+                and selectedness.user_id = ?
+                and selectedness.word_pos_id = ?
+                and alt.source_defn_id = ?
+            order by definition_id
+            '''
+            alt_not_selected_weight_table = pd.read_sql(
+                alt_not_selected_query,
+                params=(user.user_id, word_pos_id, src_defn_id),
+                con=self.connection,
+                index_col='definition_id')
+            alt_not_selected_sum = decay_sum_wd(alt_not_selected_weight_table, timestamp, decay_factor)
 
-        alt_defn_weight_table['selected'] = alt_defn_weight_table['selected'].add(
-            alt_selected_sum['weight'],
-            fill_value=0)
-        alt_defn_weight_table['not_selected'] = alt_defn_weight_table['not_selected'].add(
-            alt_not_selected_sum['weight'],
-            fill_value=0)
-        
-        # TODO: Sample and choose min
-        rewards = alt_defn_weight_table.apply(
-            lambda x: random.betavariate(x['selected'], x['not_selected']),
-            axis=1)
-        best_alternates = rewards.sort_values(ascending=True).index.get_level_values('definition_id')[:num_options - 1]
+            alt_defn_weight_table['selected'] = alt_defn_weight_table['selected'].add(
+                alt_selected_sum['weight'],
+                fill_value=0)
+            alt_defn_weight_table['not_selected'] = alt_defn_weight_table['not_selected'].add(
+                alt_not_selected_sum['weight'],
+                fill_value=0)
+            
+            # TODO: Sample and choose min
+            beta_sample: Callable[[Any], float] = lambda x: random.betavariate(x['selected'], x['not_selected'])
+            # print('alt defn weight table shape', alt_defn_weight_table.shape)
+            # if alt_defn_weight_table.shape[0] == 0:
+            #     print('word_pos_id', word_pos_id, 'src_defn_id', src_defn_id, 'has empty weight table')
+            rewards = alt_defn_weight_table.apply(
+                beta_sample,
+                axis=1)
+            best_alternates: pd.Index[int] = rewards.sort_values(ascending=True).index.get_level_values('definition_id')[:num_options - 1]
 
-        all_options = [src_defn_id] + [int(defn_id) for defn_id in best_alternates]
+            alternate_options = [int(defn_id) for defn_id in best_alternates]
+        else:
+            alternate_options = []
+
+        all_options = [src_defn_id] + alternate_options
         random.shuffle(all_options)
         return all_options
 
