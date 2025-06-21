@@ -29,7 +29,7 @@ class UserModel(object):
     def create_user(self, user_name: str):
         cur = self.connection.cursor()
         try:
-            result = cur.execute('insert into users (user_name) values (?) returning (users.id, users.user_name)', (user_name,)).fetchone()
+            result = cur.execute('insert into users (user_name) values (?) returning users.id, users.user_name', (user_name,)).fetchone()
             self.connection.commit()
             return User(result[0], result[1])
         except:

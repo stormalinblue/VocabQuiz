@@ -27,7 +27,8 @@ def main(argv):
     user_cli = UserCLIView(user_model)
     user_cli.add_subparsers(subparsers)
     args = parser.parse_args(argv)
-    args.func(args)
+    if hasattr(args, 'func'):
+        args.func(args)
     db_connection.close()
 
 if __name__ == '__main__':

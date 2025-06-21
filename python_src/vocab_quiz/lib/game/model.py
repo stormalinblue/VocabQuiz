@@ -10,8 +10,9 @@ from ..common import exceptions
 from ..user.model import User
 
 LAMBDA: float = math.log(1 - 0.02)
-PRIOR_CORRECT: float = 0.25
-PRIOR_INCORRECT: float = 0.75
+MULTIPLER: float = 1
+PRIOR_CORRECT: float = 0.25 * MULTIPLER
+PRIOR_INCORRECT: float = 0.75 * MULTIPLER
 SECONDS_IN_DAY = 86400
 
 def decay_sum(table: pd.DataFrame, current_time: float, decay_factor: float) -> float:
@@ -67,17 +68,33 @@ def word_weight_table(
         con=connection)
     incorrect_sum = decay_sum_wp(incorrect_table, timestamp, decay_factor)
 
-    word_weight_table['correct'] = np.maximum(
+    # word_weight_table['correct'] = np.maximum(
+    #     word_weight_table['correct'].add(
+    #         correct_sum['weight'],
+    #         fill_value=0
+    #     ).subtract(
+    #         incorrect_sum['weight'],
+    #         fill_value=0
+    #     ), prior_correct)
+    # word_weight_table['incorrect'] = np.maximum(
+    #     word_weight_table['incorrect'].add(
+    #         incorrect_sum['weight'],
+    #         fill_value=0),
+    #     prior_incorrect)
+    
+    word_weight_table['correct'] = (
         word_weight_table['correct'].add(
             correct_sum['weight'],
             fill_value=0
         ).subtract(
             incorrect_sum['weight'],
             fill_value=0
-        ), prior_correct)
-    word_weight_table['incorrect'] = np.maximum(word_weight_table['incorrect'].add(
-        incorrect_sum['weight'],
-        fill_value=0), prior_incorrect)
+        )) + prior_correct
+    word_weight_table['incorrect'] = (
+        word_weight_table['incorrect'].add(
+            incorrect_sum['weight'],
+            fill_value=0)
+        ) + prior_incorrect
     return word_weight_table
 
 
